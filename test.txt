@@ -1,0 +1,43 @@
+python -c "
+import pandas as pd
+df=pd.read_csv('output/bills_parsed_v2.csv')
+print(df[df['file_name']=='CARTERS.pdf'].T)
+"
+
+python - <<'PY'
+import pandas as pd
+df = pd.read_csv("output/bills_parsed_v2.csv")
+
+row = df[df["tarifa"].isna()].iloc[0]
+print("FILE:", row["CHURRERIA PORFIRIO.pdf"])
+print("\n--- TEXT SNIPPET ---\n")
+from parser.extract_text import extract_text_pdfplumber
+print(extract_text_pdfplumber(row["file_path"], max_pages=2)[:1500])
+PY
+path = "/Users/jjesusricojericomelgoiza/Allux_Fraternity/01. V1_Ambar Fashion Mall Tuxtla/7. Recibos CFE/RECIBOS LUZ LOCATARIOS/CARTERS.pdf"
+
+python - << 'EOF'
+from parser.extract_text import extract_text_pdfplumber
+from parser.parse_fields import parse_bill_fields
+import json
+
+pdf = "/Users/jjesusricojericomelgoiza/Allux_Fraternity/01. V1_Ambar Fashion Mall Tuxtla/7. Recibos CFE/RECIBOS LUZ LOCATARIOS/CARTERS.pdf"
+
+text = extract_text_pdfplumber(pdf, max_pages=2)
+fields = parse_bill_fields(text)
+
+print(json.dumps(fields, indent=2, ensure_ascii=False))
+EOF
+
+python - << 'EOF'
+from parser.extract_text import extract_text_pdfplumber
+
+pdf = "/Users/jjesusricojericomelgoiza/Allux_Fraternity/01. V1_Ambar Fashion Mall Tuxtla/7. Recibos CFE/RECIBOS LUZ LOCATARIOS/CARTERS.pdf"
+
+
+text = extract_text_pdfplumber(pdf, max_pages=2)
+
+print("TEXT LENGTH:", len(text))
+print("\nFIRST 1000 CHARACTERS:\n")
+print(text[:1000])
+EOF
