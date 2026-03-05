@@ -21,6 +21,187 @@ def safe_numeric(df: pd.DataFrame, col: str) -> None:
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
 
+
+import numpy as np
+import pandas as pd
+
+def compute_mall_fingerprints(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mall-level rollup for benchmarking.
+
+    Required columns:
+      - mall_folder
+      - recibos_subgroup
+      - medidor
+      - kwh_total
+      - importe_total
+      - tarifa
+    """
+    required = {"mall_folder", "recibos_subgroup", "medidor", "kwh_total", "importe_total", "tarifa"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"compute_mall_fingerprints missing columns: {sorted(missing)}")
+
+    x = df.copy()
+    x["kwh_total"] = pd.to_numeric(x["kwh_total"], errors="coerce")
+    x["importe_total"] = pd.to_numeric(x["importe_total"], errors="coerce")
+
+    # Cost per kWh at bill level (avoid divide by 0)
+    x["mxn_per_kwh"] = np.where(
+        (x["kwh_total"].notna()) & (x["kwh_total"] > 0) & (x["importe_total"].notna()),
+        x["importe_total"] / x["kwh_total"],
+        np.nan,
+    )
+
+    g = x.groupby(["mall_folder", "recibos_subgroup"], dropna=False)
+
+    out = g.agg(
+        bills=("kwh_total", "count"),
+        meters=("medidor", pd.Series.nunique),
+        kwh_sum=("kwh_total", "sum"),
+        kwh_mean_bill=("kwh_total", "mean"),
+        importe_sum=("importe_total", "sum"),
+        mxn_per_kwh_mean=("mxn_per_kwh", "mean"),
+    ).reset_index()
+
+    # A very handy metric: average kWh per meter (over the whole dataset window)
+    out["kwh_per_meter"] = out["kwh_sum"] / out["meters"]
+
+    # Tariff mix (shares) for quick mall characterization
+    # We compute shares by bill count (simple + robust).
+    tariff_counts = (
+        x.assign(tarifa=x["tarifa"].astype(str))
+         .groupby(["mall_folder", "recibos_subgroup", "tarifa"], dropna=False)
+         .size()
+         .rename("tarifa_bills")
+         .reset_index()
+    )
+
+    # Pivot tariffs into columns like share_PDBT, share_GDMTO, etc.
+    totals = tariff_counts.groupby(["mall_folder", "recibos_subgroup"])["tarifa_bills"].sum().rename("tarifa_bills_total")
+    tariff_counts = tariff_counts.merge(totals.reset_index(), on=["mall_folder", "recibos_subgroup"], how="left")
+    tariff_counts["tarifa_share"] = tariff_counts["tarifa_bills"] / tariff_counts["tarifa_bills_total"]
+
+    tariff_pivot = (
+        tariff_counts.pivot_table(
+            index=["mall_folder", "recibos_subgroup"],
+            columns="tarifa",
+            values="tarifa_share",
+            fill_value=0.0,
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+
+    # Rename columns to share_<tarifa>
+    for c in list(tariff_pivot.columns):
+        if c not in ("mall_folder", "recibos_subgroup"):
+            tariff_pivot = tariff_pivot.rename(columns={c: f"share_{c}"})
+
+    out = out.merge(tariff_pivot, on=["mall_folder", "recibos_subgroup"], how="left")
+
+    return out.sort_values(["mall_folder", "recibos_subgroup"]).reset_index(drop=True)
+
+def compute_tenant_fingerprints(
+    df: pd.DataFrame,
+    hours_default: float = 720.0,
+) -> pd.DataFrame:
+    """
+    Produces a per-tenant (per 'medidor') fingerprint table.
+
+    Expected columns in df (based on your dataset):
+      - medidor
+      - mall_folder
+      - recibos_subgroup
+      - tarifa
+      - kwh_total
+      - importe_total
+      - periodo_inicio (optional)
+      - periodo_fin (optional)
+
+    Output columns:
+      - mall_folder, recibos_subgroup, medidor
+      - tarifa_mode
+      - bills_count
+      - kwh_sum, kwh_mean, kwh_median
+      - importe_sum, importe_mean, mxn_per_kwh_mean
+      - first_periodo_inicio, last_periodo_fin
+      - months_span (rough)
+    """
+
+    required = {"medidor", "kwh_total", "importe_total", "tarifa", "mall_folder", "recibos_subgroup"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"compute_tenant_fingerprints missing columns: {sorted(missing)}")
+
+    x = df.copy()
+
+    # Normalize types
+    x["kwh_total"] = pd.to_numeric(x["kwh_total"], errors="coerce")
+    x["importe_total"] = pd.to_numeric(x["importe_total"], errors="coerce")
+
+    # Dates (optional but very useful)
+    for c in ["periodo_inicio", "periodo_fin"]:
+        if c in x.columns:
+            x[c] = pd.to_datetime(x[c], errors="coerce")
+
+    # Avoid divide-by-zero
+    x["mxn_per_kwh"] = np.where(
+        (x["kwh_total"].notna()) & (x["kwh_total"] > 0) & (x["importe_total"].notna()),
+        x["importe_total"] / x["kwh_total"],
+        np.nan,
+    )
+
+    group_keys = ["mall_folder", "recibos_subgroup", "medidor"]
+
+    def mode_or_nan(s: pd.Series):
+        s = s.dropna().astype(str)
+        if s.empty:
+            return np.nan
+        return s.mode().iloc[0]
+
+    agg = {
+        "tarifa": mode_or_nan,
+        "kwh_total": ["count", "sum", "mean", "median"],
+        "importe_total": ["sum", "mean"],
+        "mxn_per_kwh": ["mean", "median"],
+    }
+
+    out = x.groupby(group_keys, dropna=False).agg(agg)
+
+    # Flatten columns
+    out.columns = [
+        "tarifa_mode",
+        "bills_count",
+        "kwh_sum",
+        "kwh_mean",
+        "kwh_median",
+        "importe_sum",
+        "importe_mean",
+        "mxn_per_kwh_mean",
+        "mxn_per_kwh_median",
+    ]
+    out = out.reset_index()
+
+    # Optional period coverage metrics
+    if "periodo_inicio" in x.columns:
+        first_start = x.groupby(group_keys)["periodo_inicio"].min().rename("first_periodo_inicio")
+        out = out.merge(first_start.reset_index(), on=group_keys, how="left")
+
+    if "periodo_fin" in x.columns:
+        last_end = x.groupby(group_keys)["periodo_fin"].max().rename("last_periodo_fin")
+        out = out.merge(last_end.reset_index(), on=group_keys, how="left")
+
+    # Rough span in months (useful to judge completeness)
+    if "first_periodo_inicio" in out.columns and "last_periodo_fin" in out.columns:
+        span_days = (out["last_periodo_fin"] - out["first_periodo_inicio"]).dt.days
+        out["months_span"] = (span_days / 30.0).round(1)
+
+    # Sort for readability
+    out = out.sort_values(["mall_folder", "recibos_subgroup", "medidor"]).reset_index(drop=True)
+
+    return out
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze parsed CFE bills CSV and produce summaries.")
     ap.add_argument("--input", "-i", default="output/bills_parsed_v2.csv", help="Path to bills_parsed_v2.csv")
@@ -36,6 +217,16 @@ def main() -> None:
 
     df = pd.read_csv(in_path)
     df.columns = [c.strip() for c in df.columns]
+# --- Tenant fingerprints ---
+    tenant_fp = compute_tenant_fingerprints(df)
+    tenant_fp_path = outdir / "tenant_fingerprints.csv"
+    tenant_fp.to_csv(tenant_fp_path, index=False)
+
+    print(f"✅ Wrote:  {tenant_fp_path}")
+    mall_fp = compute_mall_fingerprints(df)
+    mall_fp_path = outdir / "mall_fingerprints.csv"
+    mall_fp.to_csv(mall_fp_path, index=False)
+    print(f"✅ Wrote:  {mall_fp_path}")
 
     # Try to locate common columns across versions
     col_tarifa = pick_column(df, ["tarifa", "Tarifa", "TARIFA"])
@@ -116,6 +307,7 @@ def main() -> None:
     if (outdir / "tenant_fingerprints.csv").exists():
         print(f"✅ Wrote:  {outdir / 'tenant_fingerprints.csv'}")
     print(f"✅ Figures in: {figdir}")
+
 
 
 if __name__ == "__main__":
