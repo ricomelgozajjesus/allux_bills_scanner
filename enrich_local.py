@@ -881,6 +881,291 @@ def extract_gdmto_fields(text):
     return result
 
 
+def extract_gdbt_fields(text):
+    """
+    Extrae campos relevantes para tarifa GDBT.
+
+    GDBT no usa el bloque horario Base/Intermedia/Punta de GDMTH.
+    Esta función se enfoca en recuperar:
+      - kWh total
+      - kW / demanda máxima
+      - kVArh
+      - factor de potencia
+      - carga conectada y demanda contratada
+      - importes principales
+      - bonificación / penalización por factor de potencia
+      - bloque crudo para auditoría
+
+    La estrategia es robusta ante texto PDF colapsado:
+      - primero intenta por líneas
+      - después por patrones sobre texto normalizado
+    """
+    result = {
+        "kwh_total": None,
+        "kwmax": None,
+        "kvarh": None,
+        "factor_potencia_pct": None,
+
+        "carga_conectada_kw": None,
+        "demanda_contratada_kw": None,
+
+        "bonificacion_factor_potencia": None,
+        "penalizacion_factor_potencia": None,
+
+        "subtotal_energia": None,
+        "subtotal": None,
+        "iva": None,
+        "total_linea": None,
+
+        "tarifa_horaria_detectada": False,
+        "bloque_tarifa_gdbt_raw": None,
+    }
+
+    raw = text or ""
+    txt = normalize_spaces(raw)
+
+    if re.search(r"\bGDBT\b", txt, flags=re.IGNORECASE):
+        result["tarifa_horaria_detectada"] = True
+
+    lines = [normalize_spaces(ln) for ln in raw.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    # ------------------------------------------------------------
+    # Bloque crudo para auditoría
+    # ------------------------------------------------------------
+    block_lines = []
+
+    for line in lines:
+        if re.match(r"^kWh\b", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.match(r"^kW\b", line, flags=re.IGNORECASE) and not re.match(
+            r"^kWh\b", line, flags=re.IGNORECASE
+        ):
+            block_lines.append(line)
+        elif re.match(r"^kVArh\b", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Factor\s+de\s+potencia", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Carga\s+conectada", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Demanda\s+contratada", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Bonificaci[oó]n\s+Factor\s+de\s+Potencia", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Cargo\s+Factor\s+de\s+Potencia", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+        elif re.search(r"Total\s+a\s+pagar|Subtotal|IVA", line, flags=re.IGNORECASE):
+            block_lines.append(line)
+
+    if block_lines:
+        result["bloque_tarifa_gdbt_raw"] = " | ".join(block_lines)
+    else:
+        mblock = re.search(
+            r"(GDBT.{0,2500}?(Total\s+a\s+pagar|Importe|Subtotal|IVA|Facturaci[oó]n))",
+            txt,
+            flags=re.IGNORECASE,
+        )
+        if not mblock:
+            mblock = re.search(
+                r"((kWh|kW|kVArh|Factor\s+de\s+Potencia).{0,2500}?"
+                r"(Total\s+a\s+pagar|Importe|Subtotal|IVA))",
+                txt,
+                flags=re.IGNORECASE,
+            )
+        if mblock:
+            result["bloque_tarifa_gdbt_raw"] = mblock.group(1)
+
+    # ------------------------------------------------------------
+    # Carga conectada y demanda contratada
+    # ------------------------------------------------------------
+    contract_patterns = {
+        "carga_conectada_kw": [
+            r"Carga\s+conectada\s*:?\s*([0-9,]+(?:\.[0-9]+)?)\s*kW",
+            r"Carga\s+conectada\s*\(kW\)\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Carga\s+Conectada\s+([0-9,]+(?:\.[0-9]+)?)",
+        ],
+        "demanda_contratada_kw": [
+            r"Demanda\s+contratada\s*:?\s*([0-9,]+(?:\.[0-9]+)?)\s*kW",
+            r"Demanda\s+contratada\s*\(kW\)\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Demanda\s+Contratada\s+([0-9,]+(?:\.[0-9]+)?)",
+        ],
+    }
+
+    for field, patterns in contract_patterns.items():
+        for pat in patterns:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result[field] = clean_number(m.group(1))
+                break
+
+    # ------------------------------------------------------------
+    # Filas kWh / kW / kVArh
+    # ------------------------------------------------------------
+    kwh_line = None
+    kw_line = None
+    kvarh_line = None
+
+    for line in lines:
+        if kwh_line is None and re.match(r"^kWh\b", line, flags=re.IGNORECASE):
+            kwh_line = line
+        elif kw_line is None and re.match(r"^kW\b", line, flags=re.IGNORECASE) and not re.match(
+            r"^kWh\b", line, flags=re.IGNORECASE
+        ):
+            kw_line = line
+        elif kvarh_line is None and re.match(r"^kVArh\b", line, flags=re.IGNORECASE):
+            kvarh_line = line
+
+    if kwh_line:
+        nums = re.findall(r"-?\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?", kwh_line)
+        nums = [clean_number(n) for n in nums]
+        nums = [n for n in nums if n is not None]
+        if nums:
+            # En los recibos GDBT observados, la fila puede traer:
+            # lectura actual, lectura anterior, diferencia, total.
+            # El último número suele ser el total útil; si solo hay uno, usar ese.
+            result["kwh_total"] = nums[-1]
+
+    if kw_line:
+        nums = re.findall(r"-?\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?", kw_line)
+        nums = [clean_number(n) for n in nums]
+        nums = [n for n in nums if n is not None]
+        if nums:
+            result["kwmax"] = nums[-1]
+
+    if kvarh_line:
+        nums = re.findall(r"-?\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?", kvarh_line)
+        nums = [clean_number(n) for n in nums]
+        nums = [n for n in nums if n is not None]
+        if nums:
+            result["kvarh"] = nums[-1]
+
+    # Fallbacks si no se encontraron por línea.
+    if result["kwh_total"] is None:
+        patterns = [
+            r"\bkWh\b\s+[A-Z0-9]+\s+(?:[0-9,]+(?:\.[0-9]+)?\s+){0,4}([0-9,]+(?:\.[0-9]+)?)",
+            r"\bkWh\b\s+([0-9,]+(?:\.[0-9]+)?)",
+            r"Consumo\s+(?:de\s+)?energ[ií]a\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Energ[ií]a\s+\(kWh\)\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Total\s+kWh\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result["kwh_total"] = clean_number(m.group(1))
+                break
+
+    if result["kwmax"] is None:
+        patterns = [
+            r"\bkW\b\s+[A-Z0-9]+\s+(?:[0-9,]+(?:\.[0-9]+)?\s+){0,4}([0-9,]+(?:\.[0-9]+)?)",
+            r"Demanda\s+m[aá]xima\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Demanda\s+\(kW\)\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result["kwmax"] = clean_number(m.group(1))
+                break
+
+    if result["kvarh"] is None:
+        patterns = [
+            r"\bkVArh\b\s+[A-Z0-9]+\s+(?:[0-9,]+(?:\.[0-9]+)?\s+){0,4}([0-9,]+(?:\.[0-9]+)?)",
+            r"Energ[ií]a\s+reactiva\s*:?\s*([0-9,]+(?:\.[0-9]+)?)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result["kvarh"] = clean_number(m.group(1))
+                break
+
+    # ------------------------------------------------------------
+    # Factor de potencia y FP
+    # ------------------------------------------------------------
+    fp = last_number_from_matching_lines(
+        lines,
+        [
+            r"Factor\s+de\s+potencia",
+            r"Factor\s+de\s+Potencia",
+            r"\bFP\b",
+            r"F\.?\s*P\.?",
+        ],
+    )
+    if fp is not None:
+        result["factor_potencia_pct"] = fp
+    else:
+        patterns = [
+            r"Factor\s+de\s+potencia\s*:?\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+            r"F\.?\s*P\.?\s*:?\s*([0-9]+(?:\.[0-9]+)?)\s*%?",
+        ]
+        for pat in patterns:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result["factor_potencia_pct"] = clean_number(m.group(1))
+                break
+
+    result["bonificacion_factor_potencia"] = last_number_from_matching_lines(
+        lines,
+        [
+            r"Bonificaci[oó]n\s+Factor\s+de\s+Potencia",
+            r"Bonificaci[oó]n\s+FP",
+            r"Bonificaci[oó]n",
+        ],
+    )
+    if result["bonificacion_factor_potencia"] is not None:
+        result["bonificacion_factor_potencia"] = -abs(result["bonificacion_factor_potencia"])
+
+    result["penalizacion_factor_potencia"] = last_number_from_matching_lines(
+        lines,
+        [
+            r"Penalizaci[oó]n\s+Factor\s+de\s+Potencia",
+            r"Cargo\s+Factor\s+de\s+Potencia",
+            r"Penalizaci[oó]n\s+FP",
+            r"Penalizaci[oó]n",
+        ],
+    )
+
+    # ------------------------------------------------------------
+    # Importes principales
+    # ------------------------------------------------------------
+    result["iva"] = last_number_from_matching_lines(lines, [r"\bIVA\b"])
+
+    result["subtotal"] = last_number_from_matching_lines(
+        lines,
+        [
+            r"\bSubtotal\b",
+        ],
+    )
+
+    result["subtotal_energia"] = last_number_from_matching_lines(
+        lines,
+        [
+            r"Subtotal\s+energ[ií]a",
+            r"Energ[ií]a\s+\$",
+        ],
+    )
+
+    result["total_linea"] = last_number_from_matching_lines(
+        lines,
+        [
+            r"Total\s+a\s+pagar",
+            r"Total\s+del\s+periodo",
+            r"Total\s+\$",
+        ],
+    )
+
+    # Fallback sobre texto normalizado para total.
+    if result["total_linea"] is None:
+        for pat in [
+            r"Total\s+a\s+pagar\s*:?\s*\$?\s*([0-9,]+(?:\.[0-9]+)?)",
+            r"Total\s+del\s+periodo\s*:?\s*\$?\s*([0-9,]+(?:\.[0-9]+)?)",
+        ]:
+            m = re.search(pat, txt, flags=re.IGNORECASE)
+            if m:
+                result["total_linea"] = clean_number(m.group(1))
+                break
+
+    return result
+
+
 # ============================================================
 # Enriquecimiento principal
 # ============================================================
@@ -915,6 +1200,7 @@ ENRICHMENT_COLUMNS = [
     # Auditoría de extracción
     "tarifa_horaria_detectada",
     "bloque_tarifa_horaria_raw",
+    "bloque_tarifa_gdbt_raw",
 
     # Control de enriquecimiento
     "enriched",
@@ -946,15 +1232,18 @@ def should_process_row(row, tariffs=None, only_missing=True):
 
     if only_missing:
         has_address = pd.notna(row.get("direccion_completa"))
-        has_hourly = (
+        has_tariff_enrichment = (
             pd.notna(row.get("kwh_base"))
             or pd.notna(row.get("kwh_intermedia"))
             or pd.notna(row.get("kwh_punta"))
             or pd.notna(row.get("kwmax"))
             or pd.notna(row.get("kwh_total_horario"))
+            or pd.notna(row.get("kwh_total"))
+            or pd.notna(row.get("kvarh"))
+            or pd.notna(row.get("factor_potencia_pct"))
         )
 
-        if has_address and has_hourly:
+        if has_address and has_tariff_enrichment:
             return False
 
     return True
@@ -1051,6 +1340,14 @@ def enrich_dataframe(
 
                 df.at[idx, "enrichment_tariff_mode"] = "GDMTO"
 
+            elif "GDBT" in tarifa:
+                tariff_fields = extract_gdbt_fields(text)
+
+                for key, value in tariff_fields.items():
+                    df.at[idx, key] = value
+
+                df.at[idx, "enrichment_tariff_mode"] = "GDBT"
+
             else:
                 df.at[idx, "enrichment_tariff_mode"] = tarifa
 
@@ -1114,8 +1411,8 @@ def parse_args():
 
     parser.add_argument(
         "--tariffs",
-        default="GDMTH,GDMTO",
-        help="Tarifas a enriquecer separadas por coma. Default: GDMTH,GDMTO",
+        default="GDMTH,GDMTO,GDBT",
+        help="Tarifas a enriquecer separadas por coma. Default: GDMTH,GDMTO,GDBT",
     )
 
     parser.add_argument(
